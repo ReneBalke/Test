@@ -96,6 +96,11 @@ input bool              InpShowRectangles        = true;          // Show Trend 
 input color             InpUptrendRectColor      = clrLightGreen; // Uptrend Rectangle Color
 input color             InpDowntrendRectColor    = clrMistyRose;  // Downtrend Rectangle Color
 
+input group "══════════ Safety Settings ══════════"
+input int               InpCooldownAfterTrade    = 60;            // Cooldown After Trade (seconds)
+input int               InpCooldownAfterBreak    = 120;           // Cooldown After Trend Break (seconds)
+input int               InpMinBarsBetweenTrades  = 1;             // Min HTF Bars Between Trades
+
 //+------------------------------------------------------------------+
 //| Structures                                                        |
 //+------------------------------------------------------------------+
@@ -170,6 +175,15 @@ const int         MAX_SWINGS = 200;
 
 // Entry signal tracking
 datetime          g_LastEntrySignalTime = 0;
+
+// Cooldown tracking
+datetime          g_LastTradeTime = 0;           // Time of last trade execution
+datetime          g_LastTrendBreakTime = 0;      // Time of last trend break
+int               g_LastTradeTrendBarIndex = 0;  // HTF bar index when last trade was made
+int               g_TrendSwingCountAtLastTrade = 0; // Number of trend swings when last trade was made
+
+// Bar tracking for trend analysis (only analyze on new HTF bars)
+datetime          g_LastTrendAnalysisBarTime = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -254,19 +268,29 @@ void OnTick()
    //--- Check for new confirmed swings on both timeframes
    CheckForNewSwings();
 
-   //--- Store previous trend state
-   ENUM_TREND_STATE previousTrendState = g_TrendInfo.state;
+   //--- Only analyze trend on new HTF bars (optimization + stability)
+   datetime currentHTFBarTime = GetCurrentBarTime(InpTrendTimeframe);
+   bool newHTFBar = (currentHTFBarTime > g_LastTrendAnalysisBarTime);
 
-   //--- Analyze higher timeframe trend
-   AnalyzeHTFTrend();
-
-   //--- Handle trend state changes
-   if(g_TrendInfo.state != previousTrendState)
+   if(newHTFBar)
    {
-      OnTrendStateChanged(previousTrendState, g_TrendInfo.state);
+      g_LastTrendAnalysisBarTime = currentHTFBarTime;
+
+      //--- Store previous trend state
+      ENUM_TREND_STATE previousTrendState = g_TrendInfo.state;
+
+      //--- Analyze higher timeframe trend
+      AnalyzeHTFTrend();
+
+      //--- Handle trend state changes
+      if(g_TrendInfo.state != previousTrendState)
+      {
+         OnTrendStateChanged(previousTrendState, g_TrendInfo.state);
+      }
    }
 
    //--- Check for trend break (real-time, based on bid/ask)
+   //--- But respect cooldown after a trend break
    if(g_TrendInfo.state != TREND_NONE)
    {
       if(CheckTrendBreak())
@@ -281,7 +305,11 @@ void OnTick()
    {
       if(g_TrendInfo.positionsOpened < InpMaxPositionsPerTrend)
       {
-         CheckEntrySignal();
+         //--- Check cooldowns before allowing entry
+         if(IsEntryAllowed())
+         {
+            CheckEntrySignal();
+         }
       }
    }
 
@@ -290,6 +318,56 @@ void OnTick()
    {
       UpdateTrendRectangle();
    }
+}
+
+//+------------------------------------------------------------------+
+//| Get current bar time for a timeframe                              |
+//+------------------------------------------------------------------+
+datetime GetCurrentBarTime(ENUM_TIMEFRAMES tf)
+{
+   datetime barTime[];
+   ArraySetAsSeries(barTime, true);
+   if(CopyTime(_Symbol, tf, 0, 1, barTime) > 0)
+      return barTime[0];
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Check if entry is allowed (cooldown checks)                       |
+//+------------------------------------------------------------------+
+bool IsEntryAllowed()
+{
+   datetime currentTime = TimeCurrent();
+
+   //--- Check cooldown after last trade
+   if(InpCooldownAfterTrade > 0 && g_LastTradeTime > 0)
+   {
+      if(currentTime - g_LastTradeTime < InpCooldownAfterTrade)
+      {
+         return false;
+      }
+   }
+
+   //--- Check cooldown after trend break
+   if(InpCooldownAfterBreak > 0 && g_LastTrendBreakTime > 0)
+   {
+      if(currentTime - g_LastTrendBreakTime < InpCooldownAfterBreak)
+      {
+         return false;
+      }
+   }
+
+   //--- Check minimum bars between trades
+   if(InpMinBarsBetweenTrades > 0 && g_TrendSwingCountAtLastTrade > 0)
+   {
+      int currentSwingCount = ArraySize(g_TrendSwings);
+      if(currentSwingCount - g_TrendSwingCountAtLastTrade < InpMinBarsBetweenTrades)
+      {
+         return false;
+      }
+   }
+
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -835,13 +913,22 @@ void OnTrendStateChanged(ENUM_TREND_STATE oldState, ENUM_TREND_STATE newState)
          DrawTrendRectangle();
       }
 
-      //--- Reset entry signal time
-      g_LastEntrySignalTime = 0;
+      //--- IMPORTANT: Do NOT reset g_LastEntrySignalTime here!
+      //--- This prevents immediate re-entry on the same swing pattern.
+      //--- A new entry will only be allowed when a NEW swing forms on signal TF.
+      //--- The cooldowns (g_LastTrendBreakTime, g_LastTradeTime) provide additional protection.
    }
    else
    {
-      //--- Trend ended
+      //--- Trend ended (but not via break - e.g., swing pattern no longer qualifies)
       FinalizeTrendRectangle();
+
+      //--- Apply cooldown when trend disappears (prevents flickering)
+      if(oldState != TREND_NONE)
+      {
+         g_LastTrendBreakTime = TimeCurrent();
+         Print("Trend disappeared. Cooldown active for ", InpCooldownAfterBreak, " seconds");
+      }
    }
 }
 
@@ -893,7 +980,11 @@ void HandleTrendBreak()
    ENUM_TREND_STATE brokenTrend = g_TrendInfo.state;
    g_TrendInfo.Reset();
 
+   //--- Set cooldown time to prevent immediate re-entry
+   g_LastTrendBreakTime = TimeCurrent();
+
    Print("Trend break handled. Closed all positions. Previous trend: ", TrendStateToString(brokenTrend));
+   Print("Cooldown active for ", InpCooldownAfterBreak, " seconds");
 }
 
 //+------------------------------------------------------------------+
@@ -1020,7 +1111,13 @@ void ExecuteBuyTrade(double lastSwingLow)
    if(g_Trade.Buy(lots, _Symbol, entryPrice, sl, tp, comment))
    {
       g_TrendInfo.positionsOpened++;
+
+      //--- Set cooldown tracking
+      g_LastTradeTime = TimeCurrent();
+      g_TrendSwingCountAtLastTrade = ArraySize(g_TrendSwings);
+
       Print("BUY trade opened: ", lots, " lots at ", entryPrice, " | SL: ", sl, " | TP: ", tp);
+      Print("Next trade allowed after ", InpCooldownAfterTrade, " seconds or ", InpMinBarsBetweenTrades, " new HTF swing(s)");
    }
    else
    {
@@ -1064,7 +1161,13 @@ void ExecuteSellTrade(double lastSwingHigh)
    if(g_Trade.Sell(lots, _Symbol, entryPrice, sl, tp, comment))
    {
       g_TrendInfo.positionsOpened++;
+
+      //--- Set cooldown tracking
+      g_LastTradeTime = TimeCurrent();
+      g_TrendSwingCountAtLastTrade = ArraySize(g_TrendSwings);
+
       Print("SELL trade opened: ", lots, " lots at ", entryPrice, " | SL: ", sl, " | TP: ", tp);
+      Print("Next trade allowed after ", InpCooldownAfterTrade, " seconds or ", InpMinBarsBetweenTrades, " new HTF swing(s)");
    }
    else
    {

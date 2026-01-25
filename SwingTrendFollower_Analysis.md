@@ -6,6 +6,36 @@ This document analyzes the SwingTrendFollower Expert Advisor for potential probl
 
 ---
 
+## Safety Features Implemented (v1.1)
+
+The following safety features have been added to prevent rapid position opening/closing:
+
+### 1. Cooldown After Trade
+- **Input**: `InpCooldownAfterTrade` (default: 60 seconds)
+- **Purpose**: Prevents new trades for X seconds after a trade is executed
+- **Prevents**: Rapid re-entry after SL/TP closure
+
+### 2. Cooldown After Trend Break
+- **Input**: `InpCooldownAfterBreak` (default: 120 seconds)
+- **Purpose**: Prevents new entries for X seconds after a trend breaks
+- **Prevents**: Immediate trend re-detection and re-entry on same pattern
+
+### 3. Minimum Bars Between Trades
+- **Input**: `InpMinBarsBetweenTrades` (default: 1)
+- **Purpose**: Requires at least N new HTF swings to form before next trade
+- **Prevents**: Trading on stale swing patterns
+
+### 4. Trend Analysis on New Bars Only
+- HTF trend analysis now only runs when a new HTF bar forms
+- **Prevents**: Trend state flickering on every tick
+
+### 5. Signal Time Preservation
+- `g_LastEntrySignalTime` is no longer reset when trend state changes
+- A NEW swing must form on signal TF before a new entry is allowed
+- **Prevents**: Re-triggering on the same swing pattern
+
+---
+
 ## Identified Issues & Solutions
 
 ### 1. Position Counter Persistence Across EA Restarts (MEDIUM SEVERITY)
