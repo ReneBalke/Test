@@ -303,7 +303,11 @@ void OnTick()
    //--- Check for entry signals if trend is active
    if(g_TrendInfo.state != TREND_NONE)
    {
-      if(g_TrendInfo.positionsOpened < InpMaxPositionsPerTrend)
+      //--- Always use actual position count (more reliable than counter)
+      int actualPositions = CountEAPositions();
+      g_TrendInfo.positionsOpened = actualPositions;  // Sync counter
+
+      if(actualPositions < InpMaxPositionsPerTrend)
       {
          //--- Check cooldowns before allowing entry
          if(IsEntryAllowed())
@@ -342,8 +346,10 @@ bool IsEntryAllowed()
    //--- Check cooldown after last trade
    if(InpCooldownAfterTrade > 0 && g_LastTradeTime > 0)
    {
-      if(currentTime - g_LastTradeTime < InpCooldownAfterTrade)
+      int remaining = InpCooldownAfterTrade - (int)(currentTime - g_LastTradeTime);
+      if(remaining > 0)
       {
+         // Uncomment for debugging: Print("Entry blocked: Trade cooldown ", remaining, "s remaining");
          return false;
       }
    }
@@ -351,18 +357,22 @@ bool IsEntryAllowed()
    //--- Check cooldown after trend break
    if(InpCooldownAfterBreak > 0 && g_LastTrendBreakTime > 0)
    {
-      if(currentTime - g_LastTrendBreakTime < InpCooldownAfterBreak)
+      int remaining = InpCooldownAfterBreak - (int)(currentTime - g_LastTrendBreakTime);
+      if(remaining > 0)
       {
+         // Uncomment for debugging: Print("Entry blocked: Break cooldown ", remaining, "s remaining");
          return false;
       }
    }
 
-   //--- Check minimum bars between trades
+   //--- Check minimum swings between trades (not minimum bars)
    if(InpMinBarsBetweenTrades > 0 && g_TrendSwingCountAtLastTrade > 0)
    {
       int currentSwingCount = ArraySize(g_TrendSwings);
-      if(currentSwingCount - g_TrendSwingCountAtLastTrade < InpMinBarsBetweenTrades)
+      int swingsSinceTrade = currentSwingCount - g_TrendSwingCountAtLastTrade;
+      if(swingsSinceTrade < InpMinBarsBetweenTrades)
       {
+         // Uncomment for debugging: Print("Entry blocked: Need ", InpMinBarsBetweenTrades - swingsSinceTrade, " more swing(s)");
          return false;
       }
    }
@@ -382,12 +392,17 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
    {
       //--- Check if this deal is for our symbol
-      if(trans.symbol != _Symbol)
+      if(trans.symbol != "" && trans.symbol != _Symbol)
          return;
 
       //--- Get deal info to check if it's from our EA
       if(trans.deal > 0)
       {
+         //--- Need to select history first for the deal to be accessible
+         datetime startTime = TimeCurrent() - 86400;  // Last 24 hours
+         datetime endTime = TimeCurrent() + 3600;     // Plus 1 hour buffer
+         HistorySelect(startTime, endTime);
+
          long dealMagic = 0;
          if(HistoryDealSelect(trans.deal))
          {
@@ -913,21 +928,28 @@ void OnTrendStateChanged(ENUM_TREND_STATE oldState, ENUM_TREND_STATE newState)
          DrawTrendRectangle();
       }
 
-      //--- IMPORTANT: Do NOT reset g_LastEntrySignalTime here!
-      //--- This prevents immediate re-entry on the same swing pattern.
-      //--- A new entry will only be allowed when a NEW swing forms on signal TF.
-      //--- The cooldowns (g_LastTrendBreakTime, g_LastTradeTime) provide additional protection.
+      //--- CRITICAL: Reset ALL trade tracking for new trend
+      //--- This allows the first trade in the new trend without being blocked
+      //--- by cooldowns from the previous trend
+      g_TrendSwingCountAtLastTrade = 0;  // Reset swing count tracking
+      g_LastTradeTime = 0;               // Reset trade cooldown
+      g_LastEntrySignalTime = 0;         // Allow new signal pattern
+      g_LastTrendBreakTime = 0;          // Reset break cooldown for new trend
+
+      Print("New trend started. All tracking reset. Ready for new entries.");
    }
    else
    {
       //--- Trend ended (but not via break - e.g., swing pattern no longer qualifies)
       FinalizeTrendRectangle();
 
-      //--- Apply cooldown when trend disappears (prevents flickering)
+      //--- Only apply short cooldown when trend disappears (not as long as trend break)
+      //--- This prevents rapid flickering but doesn't block for too long
       if(oldState != TREND_NONE)
       {
-         g_LastTrendBreakTime = TimeCurrent();
-         Print("Trend disappeared. Cooldown active for ", InpCooldownAfterBreak, " seconds");
+         //--- Use half the break cooldown for disappearing trends
+         g_LastTrendBreakTime = TimeCurrent() - InpCooldownAfterBreak / 2;
+         Print("Trend disappeared. Short cooldown active.");
       }
    }
 }
