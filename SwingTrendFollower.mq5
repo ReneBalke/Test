@@ -55,7 +55,8 @@ input ENUM_TIMEFRAMES   InpSignalTimeframe       = PERIOD_M15;    // Signal Time
 input ENUM_TIMEFRAMES   InpTrendTimeframe        = PERIOD_H1;     // Trend Timeframe (Higher)
 
 input group "══════════ Swing Detection ══════════"
-input int               InpSwingDepth            = 5;             // Swing Depth (bars on each side)
+input int               InpSignalSwingDepth      = 5;             // Signal TF Swing Depth (bars on each side)
+input int               InpTrendSwingDepth       = 5;             // Trend TF Swing Depth (bars on each side)
 
 input group "══════════ Trend Confirmation ══════════"
 input int               InpTrendConfirmCount     = 2;             // HTF Trend Confirmation (x consecutive HH/HL or LH/LL)
@@ -263,7 +264,7 @@ int OnInit()
    Print("SwingTrendFollower EA Initialized Successfully");
    Print("Signal TF: ", EnumToString(InpSignalTimeframe));
    Print("Trend TF: ", EnumToString(InpTrendTimeframe));
-   Print("Swing Depth: ", InpSwingDepth);
+   Print("Signal Swing Depth: ", InpSignalSwingDepth, " | Trend Swing Depth: ", InpTrendSwingDepth);
    Print("Trend Confirmation: ", InpTrendConfirmCount, " consecutive HH/HL or LH/LL");
    Print("Signal Confirmation: ", InpSignalConfirmCount, " consecutive HH/HL or LH/LL");
    Print("Max Positions per Trend: ", InpMaxPositionsPerTrend);
@@ -607,9 +608,15 @@ bool ValidateInputs()
 {
    bool valid = true;
 
-   if(InpSwingDepth < 1)
+   if(InpSignalSwingDepth < 1)
    {
-      Print("ERROR: Swing Depth must be at least 1");
+      Print("ERROR: Signal Swing Depth must be at least 1");
+      valid = false;
+   }
+
+   if(InpTrendSwingDepth < 1)
+   {
+      Print("ERROR: Trend Swing Depth must be at least 1");
       valid = false;
    }
 
@@ -737,24 +744,27 @@ bool LoadSwingsForTimeframe(ENUM_TIMEFRAMES tf, SwingPoint &swings[], int barsTo
       return false;
    }
 
-   //--- Find confirmed swings
-   //--- A swing is confirmed when InpSwingDepth bars have formed to its right
-   //--- So we start checking from bar index InpSwingDepth (the newest confirmed potential swing)
-   //--- and go back to bar barsToLoad - InpSwingDepth - 1 (oldest with enough left context)
+   //--- Determine swing depth based on timeframe
+   int swingDepth = isTrendTF ? InpTrendSwingDepth : InpSignalSwingDepth;
 
-   int startBar = InpSwingDepth + 1;  // +1 to skip the bar currently being confirmed
-   int endBar = barsToLoad - InpSwingDepth - 1;
+   //--- Find confirmed swings
+   //--- A swing is confirmed when swingDepth bars have formed to its right
+   //--- So we start checking from bar index swingDepth (the newest confirmed potential swing)
+   //--- and go back to bar barsToLoad - swingDepth - 1 (oldest with enough left context)
+
+   int startBar = swingDepth + 1;  // +1 to skip the bar currently being confirmed
+   int endBar = barsToLoad - swingDepth - 1;
 
    for(int i = endBar; i >= startBar; i--)
    {
       //--- Check for swing high
-      if(IsSwingHigh(high, i, barsToLoad))
+      if(IsSwingHigh(high, i, barsToLoad, swingDepth))
       {
          AddSwingPoint(swings, time[i], high[i], SWING_HIGH, CreateBarIdentifier(time[i], high[i]), isTrendTF);
       }
 
       //--- Check for swing low
-      if(IsSwingLow(low, i, barsToLoad))
+      if(IsSwingLow(low, i, barsToLoad, swingDepth))
       {
          AddSwingPoint(swings, time[i], low[i], SWING_LOW, CreateBarIdentifier(time[i], low[i]), isTrendTF);
       }
@@ -769,23 +779,23 @@ bool LoadSwingsForTimeframe(ENUM_TIMEFRAMES tf, SwingPoint &swings[], int barsTo
 //+------------------------------------------------------------------+
 //| Check if a bar is a swing high                                    |
 //+------------------------------------------------------------------+
-bool IsSwingHigh(const double &high[], int index, int arraySize)
+bool IsSwingHigh(const double &high[], int index, int arraySize, int swingDepth)
 {
    //--- Boundary check
-   if(index < InpSwingDepth || index >= arraySize - InpSwingDepth)
+   if(index < swingDepth || index >= arraySize - swingDepth)
       return false;
 
    double pivotHigh = high[index];
 
    //--- Check bars to the left (older bars - higher index in series array)
-   for(int i = 1; i <= InpSwingDepth; i++)
+   for(int i = 1; i <= swingDepth; i++)
    {
       if(high[index + i] >= pivotHigh)
          return false;
    }
 
    //--- Check bars to the right (newer bars - lower index in series array)
-   for(int i = 1; i <= InpSwingDepth; i++)
+   for(int i = 1; i <= swingDepth; i++)
    {
       if(high[index - i] >= pivotHigh)
          return false;
@@ -797,23 +807,23 @@ bool IsSwingHigh(const double &high[], int index, int arraySize)
 //+------------------------------------------------------------------+
 //| Check if a bar is a swing low                                     |
 //+------------------------------------------------------------------+
-bool IsSwingLow(const double &low[], int index, int arraySize)
+bool IsSwingLow(const double &low[], int index, int arraySize, int swingDepth)
 {
    //--- Boundary check
-   if(index < InpSwingDepth || index >= arraySize - InpSwingDepth)
+   if(index < swingDepth || index >= arraySize - swingDepth)
       return false;
 
    double pivotLow = low[index];
 
    //--- Check bars to the left (older bars - higher index in series array)
-   for(int i = 1; i <= InpSwingDepth; i++)
+   for(int i = 1; i <= swingDepth; i++)
    {
       if(low[index + i] <= pivotLow)
          return false;
    }
 
    //--- Check bars to the right (newer bars - lower index in series array)
-   for(int i = 1; i <= InpSwingDepth; i++)
+   for(int i = 1; i <= swingDepth; i++)
    {
       if(low[index - i] <= pivotLow)
          return false;
@@ -906,7 +916,9 @@ void CheckNewSwingsForTimeframe(ENUM_TIMEFRAMES tf, SwingPoint &swings[], dateti
    ArraySetAsSeries(low, true);
    ArraySetAsSeries(time, true);
 
-   int barsNeeded = InpSwingDepth * 2 + 5;
+   //--- Determine swing depth based on timeframe
+   int swingDepth = isTrendTF ? InpTrendSwingDepth : InpSignalSwingDepth;
+   int barsNeeded = swingDepth * 2 + 5;
 
    if(CopyHigh(_Symbol, tf, 0, barsNeeded, high) < barsNeeded)
       return;
@@ -915,14 +927,14 @@ void CheckNewSwingsForTimeframe(ENUM_TIMEFRAMES tf, SwingPoint &swings[], dateti
    if(CopyTime(_Symbol, tf, 0, barsNeeded, time) < barsNeeded)
       return;
 
-   //--- The bar that just got confirmed is at index InpSwingDepth
-   //--- (it now has InpSwingDepth bars to its right that have closed)
-   int checkIndex = InpSwingDepth;
+   //--- The bar that just got confirmed is at index swingDepth
+   //--- (it now has swingDepth bars to its right that have closed)
+   int checkIndex = swingDepth;
 
    bool newSwingAdded = false;
 
    //--- Check for swing high
-   if(IsSwingHigh(high, checkIndex, barsNeeded))
+   if(IsSwingHigh(high, checkIndex, barsNeeded, swingDepth))
    {
       long barId = CreateBarIdentifier(time[checkIndex], high[checkIndex]);
       int prevSize = ArraySize(swings);
@@ -932,7 +944,7 @@ void CheckNewSwingsForTimeframe(ENUM_TIMEFRAMES tf, SwingPoint &swings[], dateti
    }
 
    //--- Check for swing low
-   if(IsSwingLow(low, checkIndex, barsNeeded))
+   if(IsSwingLow(low, checkIndex, barsNeeded, swingDepth))
    {
       long barId = CreateBarIdentifier(time[checkIndex], low[checkIndex]);
       int prevSize = ArraySize(swings);
