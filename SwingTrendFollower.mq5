@@ -185,6 +185,26 @@ int               g_TrendSwingCountAtLastTrade = 0; // Number of trend swings wh
 // Bar tracking for trend analysis (only analyze on new HTF bars)
 datetime          g_LastTrendAnalysisBarTime = 0;
 
+//=== PERFORMANCE OPTIMIZATION: Cached arrays ===
+// Cached separated highs/lows for HTF (updated only when swings change)
+double            g_CachedTrendHighs[];
+double            g_CachedTrendLows[];
+datetime          g_CachedTrendHighTimes[];
+datetime          g_CachedTrendLowTimes[];
+int               g_CachedTrendSwingCount = 0;    // Track when cache needs refresh
+
+// Cached separated highs/lows for Signal TF
+double            g_CachedSignalHighs[];
+double            g_CachedSignalLows[];
+datetime          g_CachedSignalHighTimes[];
+datetime          g_CachedSignalLowTimes[];
+int               g_CachedSignalSwingCount = 0;   // Track when cache needs refresh
+
+// Position count cache (updated only when needed)
+int               g_CachedPositionCount = 0;
+datetime          g_LastPositionCountTime = 0;
+const int         POSITION_COUNT_CACHE_SECONDS = 1;  // Refresh every 1 second max
+
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
 //+------------------------------------------------------------------+
@@ -209,9 +229,19 @@ int OnInit()
    g_Trade.SetTypeFilling(GetFillingMode());
    g_Trade.SetAsyncMode(false);
 
-   //--- Initialize arrays
+   //--- Initialize arrays with reserved capacity
    ArrayResize(g_TrendSwings, 0, MAX_SWINGS);
    ArrayResize(g_SignalSwings, 0, MAX_SWINGS);
+
+   //--- Initialize cache arrays with reserved capacity
+   ArrayResize(g_CachedTrendHighs, 0, MAX_SWINGS);
+   ArrayResize(g_CachedTrendLows, 0, MAX_SWINGS);
+   ArrayResize(g_CachedTrendHighTimes, 0, MAX_SWINGS);
+   ArrayResize(g_CachedTrendLowTimes, 0, MAX_SWINGS);
+   ArrayResize(g_CachedSignalHighs, 0, MAX_SWINGS);
+   ArrayResize(g_CachedSignalLows, 0, MAX_SWINGS);
+   ArrayResize(g_CachedSignalHighTimes, 0, MAX_SWINGS);
+   ArrayResize(g_CachedSignalLowTimes, 0, MAX_SWINGS);
 
    //--- Reset trend info
    g_TrendInfo.Reset();
@@ -257,29 +287,42 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                              |
+//| Expert tick function (OPTIMIZED)                                  |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   //--- Refresh symbol data
+   //--- EARLY EXIT: If no trend, only need to check for new bars occasionally
+   static datetime s_lastTickBarTime = 0;
+   datetime currentTickBarTime = GetCurrentBarTime(InpSignalTimeframe);
+   bool isNewBar = (currentTickBarTime != s_lastTickBarTime);
+
+   //--- If no trend and not a new bar, nothing to do
+   if(g_TrendInfo.state == TREND_NONE && !isNewBar)
+      return;
+
+   s_lastTickBarTime = currentTickBarTime;
+
+   //--- Refresh symbol data only when needed
    if(!g_SymbolInfo.RefreshRates())
       return;
 
-   //--- Check for new confirmed swings on both timeframes
-   CheckForNewSwings();
+   //--- Check for new confirmed swings only on new bars (major optimization)
+   if(isNewBar)
+   {
+      CheckForNewSwings();
+   }
 
-   //--- Only analyze trend on new HTF bars (optimization + stability)
+   //--- Only analyze HTF trend on new HTF bars (optimization + stability)
    datetime currentHTFBarTime = GetCurrentBarTime(InpTrendTimeframe);
-   bool newHTFBar = (currentHTFBarTime > g_LastTrendAnalysisBarTime);
 
-   if(newHTFBar)
+   if(currentHTFBarTime > g_LastTrendAnalysisBarTime)
    {
       g_LastTrendAnalysisBarTime = currentHTFBarTime;
 
       //--- Store previous trend state
       ENUM_TREND_STATE previousTrendState = g_TrendInfo.state;
 
-      //--- Analyze higher timeframe trend
+      //--- Analyze higher timeframe trend (uses cached arrays)
       AnalyzeHTFTrend();
 
       //--- Handle trend state changes
@@ -289,39 +332,31 @@ void OnTick()
       }
    }
 
+   //--- EARLY EXIT: No trend, nothing more to do
+   if(g_TrendInfo.state == TREND_NONE)
+      return;
+
    //--- Check for trend break (real-time, based on bid/ask)
-   //--- But respect cooldown after a trend break
-   if(g_TrendInfo.state != TREND_NONE)
+   if(CheckTrendBreak())
    {
-      if(CheckTrendBreak())
-      {
-         HandleTrendBreak();
-         return;  // Exit early, trend is broken
-      }
+      HandleTrendBreak();
+      return;  // Exit early, trend is broken
    }
 
    //--- Check for entry signals if trend is active
-   if(g_TrendInfo.state != TREND_NONE)
-   {
-      //--- Always use actual position count (more reliable than counter)
-      int actualPositions = CountEAPositions();
-      g_TrendInfo.positionsOpened = actualPositions;  // Sync counter
+   //--- Use cached position count to avoid expensive PositionsTotal() calls
+   int actualPositions = GetCachedPositionCount();
+   g_TrendInfo.positionsOpened = actualPositions;  // Sync counter
 
-      if(actualPositions < InpMaxPositionsPerTrend)
-      {
-         //--- Check cooldowns before allowing entry
-         if(IsEntryAllowed())
-         {
-            CheckEntrySignal();
-         }
-      }
-   }
+   if(actualPositions >= InpMaxPositionsPerTrend)
+      return;  // EARLY EXIT: Max positions reached
 
-   //--- Update trend rectangle if active
-   if(InpShowRectangles && g_TrendInfo.state != TREND_NONE)
-   {
-      UpdateTrendRectangle();
-   }
+   //--- Check cooldowns before allowing entry
+   if(!IsEntryAllowed())
+      return;  // EARLY EXIT: Cooldown active
+
+   //--- Check entry signal (uses cached arrays)
+   CheckEntrySignal();
 }
 
 //+------------------------------------------------------------------+
@@ -378,6 +413,134 @@ bool IsEntryAllowed()
    }
 
    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get cached position count (avoids expensive PositionsTotal loop)  |
+//+------------------------------------------------------------------+
+int GetCachedPositionCount()
+{
+   datetime currentTime = TimeCurrent();
+
+   //--- Return cached value if still valid
+   if(currentTime - g_LastPositionCountTime < POSITION_COUNT_CACHE_SECONDS)
+      return g_CachedPositionCount;
+
+   //--- Refresh cache
+   g_CachedPositionCount = CountEAPositions();
+   g_LastPositionCountTime = currentTime;
+
+   return g_CachedPositionCount;
+}
+
+//+------------------------------------------------------------------+
+//| Invalidate position cache (call after opening/closing trades)     |
+//+------------------------------------------------------------------+
+void InvalidatePositionCache()
+{
+   g_LastPositionCountTime = 0;
+}
+
+//+------------------------------------------------------------------+
+//| Update cached swing arrays for trend timeframe                    |
+//+------------------------------------------------------------------+
+void UpdateTrendSwingCache()
+{
+   int currentCount = ArraySize(g_TrendSwings);
+
+   //--- Skip if cache is still valid
+   if(currentCount == g_CachedTrendSwingCount)
+      return;
+
+   //--- Clear and rebuild cache
+   int highCount = 0;
+   int lowCount = 0;
+
+   //--- First pass: count highs and lows
+   for(int i = 0; i < currentCount; i++)
+   {
+      if(g_TrendSwings[i].type == SWING_HIGH)
+         highCount++;
+      else
+         lowCount++;
+   }
+
+   //--- Resize arrays once (not in loop)
+   ArrayResize(g_CachedTrendHighs, highCount, MAX_SWINGS);
+   ArrayResize(g_CachedTrendLows, lowCount, MAX_SWINGS);
+   ArrayResize(g_CachedTrendHighTimes, highCount, MAX_SWINGS);
+   ArrayResize(g_CachedTrendLowTimes, lowCount, MAX_SWINGS);
+
+   //--- Second pass: fill arrays
+   int hIdx = 0, lIdx = 0;
+   for(int i = 0; i < currentCount; i++)
+   {
+      if(g_TrendSwings[i].type == SWING_HIGH)
+      {
+         g_CachedTrendHighs[hIdx] = g_TrendSwings[i].price;
+         g_CachedTrendHighTimes[hIdx] = g_TrendSwings[i].time;
+         hIdx++;
+      }
+      else
+      {
+         g_CachedTrendLows[lIdx] = g_TrendSwings[i].price;
+         g_CachedTrendLowTimes[lIdx] = g_TrendSwings[i].time;
+         lIdx++;
+      }
+   }
+
+   g_CachedTrendSwingCount = currentCount;
+}
+
+//+------------------------------------------------------------------+
+//| Update cached swing arrays for signal timeframe                   |
+//+------------------------------------------------------------------+
+void UpdateSignalSwingCache()
+{
+   int currentCount = ArraySize(g_SignalSwings);
+
+   //--- Skip if cache is still valid
+   if(currentCount == g_CachedSignalSwingCount)
+      return;
+
+   //--- Clear and rebuild cache
+   int highCount = 0;
+   int lowCount = 0;
+
+   //--- First pass: count highs and lows
+   for(int i = 0; i < currentCount; i++)
+   {
+      if(g_SignalSwings[i].type == SWING_HIGH)
+         highCount++;
+      else
+         lowCount++;
+   }
+
+   //--- Resize arrays once (not in loop)
+   ArrayResize(g_CachedSignalHighs, highCount, MAX_SWINGS);
+   ArrayResize(g_CachedSignalLows, lowCount, MAX_SWINGS);
+   ArrayResize(g_CachedSignalHighTimes, highCount, MAX_SWINGS);
+   ArrayResize(g_CachedSignalLowTimes, lowCount, MAX_SWINGS);
+
+   //--- Second pass: fill arrays
+   int hIdx = 0, lIdx = 0;
+   for(int i = 0; i < currentCount; i++)
+   {
+      if(g_SignalSwings[i].type == SWING_HIGH)
+      {
+         g_CachedSignalHighs[hIdx] = g_SignalSwings[i].price;
+         g_CachedSignalHighTimes[hIdx] = g_SignalSwings[i].time;
+         hIdx++;
+      }
+      else
+      {
+         g_CachedSignalLows[lIdx] = g_SignalSwings[i].price;
+         g_CachedSignalLowTimes[lIdx] = g_SignalSwings[i].time;
+         lIdx++;
+      }
+   }
+
+   g_CachedSignalSwingCount = currentCount;
 }
 
 //+------------------------------------------------------------------+
@@ -786,55 +949,17 @@ void CheckNewSwingsForTimeframe(ENUM_TIMEFRAMES tf, SwingPoint &swings[], dateti
 }
 
 //+------------------------------------------------------------------+
-//| Analyze higher timeframe trend                                    |
+//| Analyze higher timeframe trend (OPTIMIZED - uses cached arrays)   |
 //+------------------------------------------------------------------+
 void AnalyzeHTFTrend()
 {
-   int size = ArraySize(g_TrendSwings);
+   //--- Update cache if needed (only rebuilds when swings changed)
+   UpdateTrendSwingCache();
+
+   int numHighs = ArraySize(g_CachedTrendHighs);
+   int numLows = ArraySize(g_CachedTrendLows);
 
    //--- Need at least (x+1) highs and (x+1) lows to confirm a trend
-   int minSwingsNeeded = (InpTrendConfirmCount + 1) * 2;
-
-   if(size < minSwingsNeeded)
-   {
-      g_TrendInfo.state = TREND_NONE;
-      return;
-   }
-
-   //--- Separate highs and lows
-   double highs[];
-   double lows[];
-   datetime highTimes[];
-   datetime lowTimes[];
-
-   ArrayResize(highs, 0);
-   ArrayResize(lows, 0);
-   ArrayResize(highTimes, 0);
-   ArrayResize(lowTimes, 0);
-
-   for(int i = 0; i < size; i++)
-   {
-      if(g_TrendSwings[i].type == SWING_HIGH)
-      {
-         int hSize = ArraySize(highs);
-         ArrayResize(highs, hSize + 1);
-         ArrayResize(highTimes, hSize + 1);
-         highs[hSize] = g_TrendSwings[i].price;
-         highTimes[hSize] = g_TrendSwings[i].time;
-      }
-      else
-      {
-         int lSize = ArraySize(lows);
-         ArrayResize(lows, lSize + 1);
-         ArrayResize(lowTimes, lSize + 1);
-         lows[lSize] = g_TrendSwings[i].price;
-         lowTimes[lSize] = g_TrendSwings[i].time;
-      }
-   }
-
-   int numHighs = ArraySize(highs);
-   int numLows = ArraySize(lows);
-
    if(numHighs < InpTrendConfirmCount + 1 || numLows < InpTrendConfirmCount + 1)
    {
       g_TrendInfo.state = TREND_NONE;
@@ -842,29 +967,29 @@ void AnalyzeHTFTrend()
    }
 
    //--- Check for uptrend: x consecutive higher highs AND x consecutive higher lows
-   bool isUptrend = CheckConsecutiveHigherSwings(highs, numHighs, InpTrendConfirmCount) &&
-                    CheckConsecutiveHigherSwings(lows, numLows, InpTrendConfirmCount);
+   bool isUptrend = CheckConsecutiveHigherSwings(g_CachedTrendHighs, numHighs, InpTrendConfirmCount) &&
+                    CheckConsecutiveHigherSwings(g_CachedTrendLows, numLows, InpTrendConfirmCount);
 
    //--- Check for downtrend: x consecutive lower highs AND x consecutive lower lows
-   bool isDowntrend = CheckConsecutiveLowerSwings(highs, numHighs, InpTrendConfirmCount) &&
-                      CheckConsecutiveLowerSwings(lows, numLows, InpTrendConfirmCount);
+   bool isDowntrend = CheckConsecutiveLowerSwings(g_CachedTrendHighs, numHighs, InpTrendConfirmCount) &&
+                      CheckConsecutiveLowerSwings(g_CachedTrendLows, numLows, InpTrendConfirmCount);
 
    //--- Update trend info
    if(isUptrend)
    {
       g_TrendInfo.state = TREND_LONG;
-      g_TrendInfo.lastHigh = highs[numHighs - 1];
-      g_TrendInfo.lastLow = lows[numLows - 1];
-      g_TrendInfo.lastHighTime = highTimes[numHighs - 1];
-      g_TrendInfo.lastLowTime = lowTimes[numLows - 1];
+      g_TrendInfo.lastHigh = g_CachedTrendHighs[numHighs - 1];
+      g_TrendInfo.lastLow = g_CachedTrendLows[numLows - 1];
+      g_TrendInfo.lastHighTime = g_CachedTrendHighTimes[numHighs - 1];
+      g_TrendInfo.lastLowTime = g_CachedTrendLowTimes[numLows - 1];
    }
    else if(isDowntrend)
    {
       g_TrendInfo.state = TREND_SHORT;
-      g_TrendInfo.lastHigh = highs[numHighs - 1];
-      g_TrendInfo.lastLow = lows[numLows - 1];
-      g_TrendInfo.lastHighTime = highTimes[numHighs - 1];
-      g_TrendInfo.lastLowTime = lowTimes[numLows - 1];
+      g_TrendInfo.lastHigh = g_CachedTrendHighs[numHighs - 1];
+      g_TrendInfo.lastLow = g_CachedTrendLows[numLows - 1];
+      g_TrendInfo.lastHighTime = g_CachedTrendHighTimes[numHighs - 1];
+      g_TrendInfo.lastLowTime = g_CachedTrendLowTimes[numLows - 1];
    }
    else
    {
@@ -1010,57 +1135,23 @@ void HandleTrendBreak()
 }
 
 //+------------------------------------------------------------------+
-//| Check for entry signal on signal timeframe                        |
+//| Check for entry signal on signal timeframe (OPTIMIZED)            |
 //+------------------------------------------------------------------+
 void CheckEntrySignal()
 {
-   int size = ArraySize(g_SignalSwings);
+   //--- Update cache if needed (only rebuilds when swings changed)
+   UpdateSignalSwingCache();
+
+   int numHighs = ArraySize(g_CachedSignalHighs);
+   int numLows = ArraySize(g_CachedSignalLows);
 
    //--- Need at least (y+1) highs and (y+1) lows
-   int minSwingsNeeded = (InpSignalConfirmCount + 1) * 2;
-
-   if(size < minSwingsNeeded)
-      return;
-
-   //--- Separate highs and lows
-   double highs[];
-   double lows[];
-   datetime highTimes[];
-   datetime lowTimes[];
-
-   ArrayResize(highs, 0);
-   ArrayResize(lows, 0);
-   ArrayResize(highTimes, 0);
-   ArrayResize(lowTimes, 0);
-
-   for(int i = 0; i < size; i++)
-   {
-      if(g_SignalSwings[i].type == SWING_HIGH)
-      {
-         int hSize = ArraySize(highs);
-         ArrayResize(highs, hSize + 1);
-         ArrayResize(highTimes, hSize + 1);
-         highs[hSize] = g_SignalSwings[i].price;
-         highTimes[hSize] = g_SignalSwings[i].time;
-      }
-      else
-      {
-         int lSize = ArraySize(lows);
-         ArrayResize(lows, lSize + 1);
-         ArrayResize(lowTimes, lSize + 1);
-         lows[lSize] = g_SignalSwings[i].price;
-         lowTimes[lSize] = g_SignalSwings[i].time;
-      }
-   }
-
-   int numHighs = ArraySize(highs);
-   int numLows = ArraySize(lows);
-
    if(numHighs < InpSignalConfirmCount + 1 || numLows < InpSignalConfirmCount + 1)
       return;
 
    //--- Get the time of the most recent swing point for signal validation
-   datetime latestSwingTime = MathMax(highTimes[numHighs - 1], lowTimes[numLows - 1]);
+   datetime latestSwingTime = MathMax(g_CachedSignalHighTimes[numHighs - 1],
+                                       g_CachedSignalLowTimes[numLows - 1]);
 
    //--- Avoid re-triggering on the same signal
    if(latestSwingTime <= g_LastEntrySignalTime)
@@ -1069,30 +1160,30 @@ void CheckEntrySignal()
    //--- Check for BUY signal: HTF uptrend + Signal TF uptrend
    if(g_TrendInfo.state == TREND_LONG)
    {
-      bool signalUptrend = CheckConsecutiveHigherSwings(highs, numHighs, InpSignalConfirmCount) &&
-                           CheckConsecutiveHigherSwings(lows, numLows, InpSignalConfirmCount);
+      bool signalUptrend = CheckConsecutiveHigherSwings(g_CachedSignalHighs, numHighs, InpSignalConfirmCount) &&
+                           CheckConsecutiveHigherSwings(g_CachedSignalLows, numLows, InpSignalConfirmCount);
 
       if(signalUptrend)
       {
          Print("BUY SIGNAL detected on Signal TF");
          g_LastEntrySignalTime = latestSwingTime;
 
-         double lastSwingLow = lows[numLows - 1];
+         double lastSwingLow = g_CachedSignalLows[numLows - 1];
          ExecuteBuyTrade(lastSwingLow);
       }
    }
    //--- Check for SELL signal: HTF downtrend + Signal TF downtrend
    else if(g_TrendInfo.state == TREND_SHORT)
    {
-      bool signalDowntrend = CheckConsecutiveLowerSwings(highs, numHighs, InpSignalConfirmCount) &&
-                             CheckConsecutiveLowerSwings(lows, numLows, InpSignalConfirmCount);
+      bool signalDowntrend = CheckConsecutiveLowerSwings(g_CachedSignalHighs, numHighs, InpSignalConfirmCount) &&
+                             CheckConsecutiveLowerSwings(g_CachedSignalLows, numLows, InpSignalConfirmCount);
 
       if(signalDowntrend)
       {
          Print("SELL SIGNAL detected on Signal TF");
          g_LastEntrySignalTime = latestSwingTime;
 
-         double lastSwingHigh = highs[numHighs - 1];
+         double lastSwingHigh = g_CachedSignalHighs[numHighs - 1];
          ExecuteSellTrade(lastSwingHigh);
       }
    }
@@ -1133,13 +1224,13 @@ void ExecuteBuyTrade(double lastSwingLow)
    if(g_Trade.Buy(lots, _Symbol, entryPrice, sl, tp, comment))
    {
       g_TrendInfo.positionsOpened++;
+      InvalidatePositionCache();  // Force position count refresh
 
       //--- Set cooldown tracking
       g_LastTradeTime = TimeCurrent();
       g_TrendSwingCountAtLastTrade = ArraySize(g_TrendSwings);
 
       Print("BUY trade opened: ", lots, " lots at ", entryPrice, " | SL: ", sl, " | TP: ", tp);
-      Print("Next trade allowed after ", InpCooldownAfterTrade, " seconds or ", InpMinBarsBetweenTrades, " new HTF swing(s)");
    }
    else
    {
@@ -1183,13 +1274,13 @@ void ExecuteSellTrade(double lastSwingHigh)
    if(g_Trade.Sell(lots, _Symbol, entryPrice, sl, tp, comment))
    {
       g_TrendInfo.positionsOpened++;
+      InvalidatePositionCache();  // Force position count refresh
 
       //--- Set cooldown tracking
       g_LastTradeTime = TimeCurrent();
       g_TrendSwingCountAtLastTrade = ArraySize(g_TrendSwings);
 
       Print("SELL trade opened: ", lots, " lots at ", entryPrice, " | SL: ", sl, " | TP: ", tp);
-      Print("Next trade allowed after ", InpCooldownAfterTrade, " seconds or ", InpMinBarsBetweenTrades, " new HTF swing(s)");
    }
    else
    {
