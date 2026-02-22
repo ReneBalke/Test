@@ -105,21 +105,26 @@ private:
          double   price   = PositionGetDouble(POSITION_PRICE_OPEN);
          datetime ptime   = (datetime)PositionGetInteger(POSITION_TIME);
 
-         SDirectionState *s = (ptype == POSITION_TYPE_BUY) ? &buy : &sell;
-
-         s.count++;
-         s.totalVolume += lots;
-         s.breakEven   += price * lots;   // accumulate; divide after loop
-
-         if(ptime >= s.lastTime)
+         if(ptype == POSITION_TYPE_BUY)
          {
-            s.lastTime  = ptime;
-            s.lastPrice = price;
+            buy.count++;
+            buy.totalVolume += lots;
+            buy.breakEven   += price * lots;
+            if(ptime >= buy.lastTime) { buy.lastTime = ptime; buy.lastPrice = price; }
+            int sz = ArraySize(buy.tickets);
+            ArrayResize(buy.tickets, sz + 1);
+            buy.tickets[sz] = ticket;
          }
-
-         int sz = ArraySize(s.tickets);
-         ArrayResize(s.tickets, sz + 1);
-         s.tickets[sz] = ticket;
+         else
+         {
+            sell.count++;
+            sell.totalVolume += lots;
+            sell.breakEven   += price * lots;
+            if(ptime >= sell.lastTime) { sell.lastTime = ptime; sell.lastPrice = price; }
+            int sz = ArraySize(sell.tickets);
+            ArrayResize(sell.tickets, sz + 1);
+            sell.tickets[sz] = ticket;
+         }
       }
 
       if(buy.totalVolume  > 0) buy.breakEven  = NormalizeDouble(buy.breakEven  / buy.totalVolume,  m_digits);
