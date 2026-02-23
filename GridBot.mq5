@@ -33,8 +33,8 @@
 //|   MXNJPY, ZARJPY, TRYJPY, CNHJPY, NZDSGD                          |
 //+------------------------------------------------------------------+
 #property copyright   "IC Trading Grid Bot"
-#property version     "3.00"
-#property description "Multi-symbol Martingale/DCA grid bot — attach to one chart"
+#property version     "4.00"
+#property description "Multi-symbol grid bot — MA filter + trailing TP"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -54,6 +54,8 @@ enum ENUM_TRADE_DIRECTION
    BOTH      = 2   // Both buy and sell
 };
 input ENUM_TRADE_DIRECTION TradeDirection = BUY_ONLY;      // Trade direction
+input int                  TrailingStartLevel = 5;         // Grid level to activate trailing TP (0 = disabled)
+input int                  MA_Period          = 100;       // Daily MA period for first-entry filter
 
 //+------------------------------------------------------------------+
 //| Per-direction state populated by a single ScanPositions() pass    |
@@ -83,6 +85,21 @@ private:
    double   m_minLot;
    double   m_maxLot;
    double   m_stepLot;
+
+   //--- Daily MA handle for first-entry filter
+   int      m_maHandle;
+
+   //--- Trailing TP extremes (reset each new cycle)
+   double   m_buyLowestPrice;
+   double   m_sellHighestPrice;
+
+   //--- Returns current daily MA value; 0 if not ready
+   double GetMA()
+   {
+      double buf[1];
+      if(CopyBuffer(m_maHandle, 0, 0, 1, buf) <= 0) return 0;
+      return buf[0];
+   }
 
    //--- Single pass: fill buy and sell state from the global position list
    void ScanPositions(SDirectionState &buy, SDirectionState &sell)
@@ -225,8 +242,18 @@ private:
    void ProcessDirection(ENUM_POSITION_TYPE posType, SDirectionState &state,
                          double ask, double bid)
    {
+      // ── No positions: apply MA filter then open first order ──────────────
       if(state.count == 0)
       {
+         double ma = GetMA();
+         if(ma <= 0) return;  // MA not ready yet
+         if(posType == POSITION_TYPE_BUY  && bid <= ma) return;  // price below MA → no buy
+         if(posType == POSITION_TYPE_SELL && ask >= ma) return;  // price above MA → no sell
+
+         // Reset trailing extremes for the new cycle
+         if(posType == POSITION_TYPE_BUY) m_buyLowestPrice   = bid;
+         else                             m_sellHighestPrice = ask;
+
          double lots = NormalizeLots(StartingLots);
          PlaceGridOrder(posType, lots, ask, bid, 1);
          return;
@@ -234,26 +261,51 @@ private:
 
       if(state.breakEven <= 0) return;
 
-      double tpPrice = (posType == POSITION_TYPE_BUY)
-         ? NormalizeDouble(state.breakEven * (1.0 + TakeProfitPercent / 100.0), m_digits)
-         : NormalizeDouble(state.breakEven * (1.0 - TakeProfitPercent / 100.0), m_digits);
+      // ── Determine TP mode ─────────────────────────────────────────────────
+      bool useTrailing = (TrailingStartLevel > 0 && state.count >= TrailingStartLevel);
+      double tpPrice;
 
-      // Check if take profit is reached
+      if(useTrailing)
+      {
+         if(posType == POSITION_TYPE_BUY)
+         {
+            // Track the lowest bid seen — TP fires when price recovers X% from that low
+            if(bid < m_buyLowestPrice || m_buyLowestPrice <= 0) m_buyLowestPrice = bid;
+            tpPrice = NormalizeDouble(m_buyLowestPrice * (1.0 + TakeProfitPercent / 100.0), m_digits);
+         }
+         else
+         {
+            // Track the highest ask seen — TP fires when price falls X% from that high
+            if(ask > m_sellHighestPrice || m_sellHighestPrice <= 0) m_sellHighestPrice = ask;
+            tpPrice = NormalizeDouble(m_sellHighestPrice * (1.0 - TakeProfitPercent / 100.0), m_digits);
+         }
+      }
+      else
+      {
+         tpPrice = (posType == POSITION_TYPE_BUY)
+            ? NormalizeDouble(state.breakEven * (1.0 + TakeProfitPercent / 100.0), m_digits)
+            : NormalizeDouble(state.breakEven * (1.0 - TakeProfitPercent / 100.0), m_digits);
+      }
+
+      // ── Check TP trigger ──────────────────────────────────────────────────
       if(posType == POSITION_TYPE_BUY && ask >= tpPrice)
       {
-         Print(m_symbol, " TP reached BUY | BE: ", state.breakEven,
+         Print(m_symbol, " TP BUY | ", (useTrailing ? "Trail low" : "BE"), ": ",
+               (useTrailing ? m_buyLowestPrice : state.breakEven),
                " | TP: ", tpPrice, " | Ask: ", ask);
          CloseAllPositions(state, posType);
          return;
       }
       if(posType == POSITION_TYPE_SELL && bid <= tpPrice)
       {
-         Print(m_symbol, " TP reached SELL | BE: ", state.breakEven,
+         Print(m_symbol, " TP SELL | ", (useTrailing ? "Trail high" : "BE"), ": ",
+               (useTrailing ? m_sellHighestPrice : state.breakEven),
                " | TP: ", tpPrice, " | Bid: ", bid);
          CloseAllPositions(state, posType);
          return;
       }
 
+      // ── Check next grid level ─────────────────────────────────────────────
       if(state.count >= MaxGridLevels || state.lastPrice <= 0) return;
 
       double nextLevel = (posType == POSITION_TYPE_BUY)
@@ -272,19 +324,19 @@ private:
       double execPrice = PlaceGridOrder(posType, newLots, ask, bid, state.count + 1);
       if(execPrice <= 0) return;
 
-      // Compute new break-even incrementally — no rescan needed
-      double newBE = NormalizeDouble(
-         (state.breakEven * state.totalVolume + execPrice * newLots)
-         / (state.totalVolume + newLots), m_digits);
+      // ── Update broker-side TP (standard mode only; trailing is EA-managed) ─
+      if(!useTrailing)
+      {
+         double newBE = NormalizeDouble(
+            (state.breakEven * state.totalVolume + execPrice * newLots)
+            / (state.totalVolume + newLots), m_digits);
 
-      double newTP = (posType == POSITION_TYPE_BUY)
-         ? NormalizeDouble(newBE * (1.0 + TakeProfitPercent / 100.0), m_digits)
-         : NormalizeDouble(newBE * (1.0 - TakeProfitPercent / 100.0), m_digits);
+         double newTP = (posType == POSITION_TYPE_BUY)
+            ? NormalizeDouble(newBE * (1.0 + TakeProfitPercent / 100.0), m_digits)
+            : NormalizeDouble(newBE * (1.0 - TakeProfitPercent / 100.0), m_digits);
 
-      // Get new position ticket via the order result
-      ulong newTicket = m_trade.ResultOrder();
-
-      UpdateTakeProfitFromState(state, newTP, newTicket);
+         UpdateTakeProfitFromState(state, newTP, m_trade.ResultOrder());
+      }
    }
 
 public:
@@ -303,6 +355,17 @@ public:
       m_minLot  = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
       m_maxLot  = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MAX);
       m_stepLot = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_STEP);
+
+      // Daily MA handle for entry filter
+      m_maHandle = iMA(m_symbol, PERIOD_D1, MA_Period, 0, MODE_SMA, PRICE_CLOSE);
+      if(m_maHandle == INVALID_HANDLE)
+      {
+         Print("ERROR: iMA handle invalid for ", m_symbol);
+         return false;
+      }
+
+      m_buyLowestPrice   = 0;
+      m_sellHighestPrice = 0;
 
       m_trade.SetExpertMagicNumber(m_magicNumber);
       m_trade.SetMarginMode();
